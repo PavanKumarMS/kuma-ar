@@ -46,6 +46,11 @@
     margin-top: 10px; width: 100%; padding: 10px; border-radius: 9px; border: none; cursor: pointer;
     background: #2c3a6b; color: #dbe2ff; font-weight: 600; font-size: 14px;
   }
+  #ar-toggle {
+    position: fixed; right: 12px; top: 12px; z-index: 26;
+    padding: 10px 16px; border-radius: 999px; border: 1px solid #2c3a6b; cursor: pointer;
+    background: rgba(10, 14, 30, .85); color: #dbe2ff; font-weight: 600; font-size: 14px;
+  }
 </style>
 </head>
 <body>
@@ -58,6 +63,7 @@
   <div id="detail-meta"></div>
   <button id="detail-recheck">Re-check now</button>
 </div>
+<button id="ar-toggle" hidden>⏸ Pause scan</button>
 <div id="start-screen">
   <h1>Kuma AR</h1>
   <p>Point your camera at the marker card after starting. Live status pops up as 3D totems.</p>
@@ -270,10 +276,13 @@ const detailEl = document.getElementById('detail');
 
 function enablePicking(renderer, camera) {
   activeRenderer = renderer; activeCamera = camera;
-  renderer.domElement.addEventListener('pointerdown', onPick);
+  // Listen on window, not the canvas: in AR mode MindAR layers its camera
+  // <video> above the canvas and would swallow taps.
+  window.addEventListener('pointerdown', onPick);
 }
 
 function onPick(e) {
+  if (e.target.closest && e.target.closest('#detail, #hud, #start-screen, #ar-toggle')) return;
   const rect = activeRenderer.domElement.getBoundingClientRect();
   const ndc = new THREE.Vector2(
     ((e.clientX - rect.left) / rect.width) * 2 - 1,
@@ -390,6 +399,7 @@ async function startAR() {
   const mindar = new MindARThree({
     container: document.getElementById('ar-container'),
     imageTargetSrc: MIND_TARGET,
+    uiScanning: 'no',   // no dimming overlay — keep the real world fully visible
   });
   const { renderer, scene, camera } = mindar;
   addLights(scene);
@@ -399,9 +409,37 @@ async function startAR() {
   anchor.group.add(world);
   buildScene(world);
   enablePicking(renderer, camera);
+  anchor.onTargetFound = () => setHud('marker locked — tap a totem for details');
+  anchor.onTargetLost = () => setHud('scanning for marker…');
+  const runLoop = () => renderer.setAnimationLoop(() => { animateTotems(); renderer.render(scene, camera); });
   await mindar.start();
-  renderer.setAnimationLoop(() => { animateTotems(); renderer.render(scene, camera); });
+  runLoop();
   setHud('scanning for marker…');
+
+  const toggleBtn = document.getElementById('ar-toggle');
+  toggleBtn.hidden = false;
+  let scanning = true;
+  toggleBtn.onclick = async () => {
+    toggleBtn.disabled = true;
+    try {
+      if (scanning) {
+        mindar.stop();
+        renderer.setAnimationLoop(null);
+        toggleBtn.textContent = '▶ Resume scan';
+        setHud('camera paused');
+      } else {
+        await mindar.start();
+        runLoop();
+        toggleBtn.textContent = '⏸ Pause scan';
+        setHud('scanning for marker…');
+      }
+      scanning = !scanning;
+    } catch (err) {
+      setHud('toggle failed: ' + err.message, true);
+    } finally {
+      toggleBtn.disabled = false;
+    }
+  };
 }
 
 (async () => {
