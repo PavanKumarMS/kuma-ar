@@ -89,7 +89,7 @@ import * as THREE from 'three';
 
 const MIND_TARGET = 'https://cdn.jsdelivr.net/gh/hiukim/mind-ar-js@1.2.5/examples/image-tracking/assets/card-example/card.mind';
 const HISTORY = 30;          // heartbeats kept per monitor
-const POLL_MS = 5000;
+const POLL_MS = 2000;
 
 const params = new URLSearchParams(location.search);
 const FLAT = params.has('flat');                  // desktop preview, no camera
@@ -104,42 +104,53 @@ const setHud = (msg, isErr) => { hud.innerHTML = isErr ? `<span class="err">${ms
 const COLORS = { up: 0x22c55e, down: 0xef4444, pending: 0xf59e0b, unknown: 0x6b7280 };
 const statusColor = b => b == null ? COLORS.unknown : (b.ok ? COLORS.up : (b.pending ? COLORS.pending : COLORS.down));
 
+const KIND_LABELS = { api: 'API', db: 'DATABASE', push: 'PUSH', ping: 'PING', dns: 'DNS', tcp: 'TCP PORT' };
+// Uptime Kuma monitor type -> visual kind
+const KUMA_TYPE_KIND = {
+  http: 'api', keyword: 'api', 'json-query': 'api', grpc: 'api',
+  mysql: 'db', postgres: 'db', sqlserver: 'db', mongodb: 'db', redis: 'db',
+  push: 'push', ping: 'ping', dns: 'dns', port: 'tcp', docker: 'tcp',
+};
+
 // ---------- monitors ----------
 // Each monitor: { id, name, beats: [{ok, pending, ms}], uptime: 0..1|null, totem }
 let monitors = [];
 
 async function initMonitors() {
   if (!KUMA_MODE) {
-    // Demo mode: "monitor" google.com straight from the browser.
-    // <img> loads aren't blocked by CORS, so favicon load time ≈ reachability + latency.
-    // The second target is intentionally broken so there's a DOWN totem to tap.
+    // Demo mode: simulated monitors of each Uptime Kuma type, with
+    // type-appropriate latency profiles and error messages.
     monitors = [
-      { id: 'google', name: 'google.com', pingUrl: 'https://www.google.com/favicon.ico', beats: [], uptime: null },
-      { id: 'broken', name: 'broken.demo', pingUrl: 'https://nonexistent-host.invalid/favicon.ico', beats: [], uptime: null },
-    ];
+      { id: 'api',  name: 'orders-api',       kind: 'api',  sim: { base: 120, jitter: 90, errMsg: 'Request failed with status code 503' } },
+      { id: 'db',   name: 'postgres-main',    kind: 'db',   sim: { base: 18,  jitter: 14, errMsg: 'connect ECONNREFUSED 10.0.2.15:5432' } },
+      { id: 'push', name: 'nightly-backup',   kind: 'push', sim: { base: 6,   jitter: 6,  errMsg: 'no heartbeat received within 60 s grace period' } },
+      { id: 'ping', name: 'core-router',      kind: 'ping', sim: { base: 4,   jitter: 5,  errMsg: 'timeout of 2000 ms exceeded (ICMP)' } },
+      { id: 'dns',  name: 'internal-dns',     kind: 'dns',  sim: { base: 35,  jitter: 28, errMsg: 'queryA ENOTFOUND api.internal' } },
+      { id: 'tcp',  name: 'redis-cache:6379', kind: 'tcp',  sim: { base: 9,   jitter: 7,  errMsg: 'connect ETIMEDOUT 10.0.0.8:6379' } },
+    ].map(m => ({ ...m, beats: [], uptime: null, simState: { down: false, left: 0 } }));
     return;
   }
   const cfg = await (await fetch(`${KUMA_BASE}/api/status-page/${KUMA_SLUG}`)).json();
   monitors = (cfg.publicGroupList || []).flatMap(g => g.monitorList || [])
-    .map(m => ({ id: m.id, name: m.name, beats: [], uptime: null }));
+    .map(m => ({ id: m.id, name: m.name, kind: KUMA_TYPE_KIND[m.type] || 'api', beats: [], uptime: null }));
   if (!monitors.length) throw new Error('status page has no monitors');
 }
 
-function pingViaImage(url, timeoutMs = 8000) {
-  return new Promise(resolve => {
-    const start = performance.now();
-    const img = new Image();
-    let done = false;
-    const finish = (ok, msg) => {
-      if (done) return;
-      done = true;
-      resolve({ ok, pending: false, ms: Math.round(performance.now() - start), msg: msg || '', at: Date.now() });
-    };
-    const timer = setTimeout(() => finish(false, `timed out after ${timeoutMs} ms`), timeoutMs);
-    img.onload = () => { clearTimeout(timer); finish(true); };
-    img.onerror = () => { clearTimeout(timer); finish(false, 'connection failed (DNS error / refused / blocked) — browser hides the exact cause; Kuma mode shows the real error'); };
-    img.src = url + '?cachebust=' + performance.now();
-  });
+// Fake heartbeat: random latency around the type's profile, with occasional
+// multi-beat outages so there's always something to inspect.
+function simulateBeat(m) {
+  const s = m.simState;
+  if (s.down) {
+    s.left--;
+    if (s.left <= 0) s.down = false;
+  } else if (Math.random() < 0.04) {
+    s.down = true;
+    s.left = 3 + Math.floor(Math.random() * 8);
+  }
+  const ok = !s.down;
+  const spike = Math.random() < 0.07 ? 2.5 : 1;
+  const ms = ok ? Math.round((m.sim.base + Math.random() * m.sim.jitter) * spike) : 0;
+  return { ok, pending: false, ms, msg: ok ? '' : m.sim.errMsg, at: Date.now() };
 }
 
 async function pollOnce() {
@@ -159,15 +170,14 @@ async function pollOnce() {
     }
   } else {
     for (const m of monitors) {
-      const beat = await pingViaImage(m.pingUrl);
-      m.beats.push(beat);
+      m.beats.push(simulateBeat(m));
       if (m.beats.length > HISTORY) m.beats.shift();
       m.uptime = m.beats.filter(b => b.ok).length / m.beats.length;
     }
   }
   monitors.forEach(updateTotem);
   if (selectedMonitor) renderDetail(selectedMonitor);
-  setHud(`${KUMA_MODE ? 'kuma: ' + KUMA_SLUG : 'demo: live-pinging google.com'}${FLAT ? ' · FLAT PREVIEW (no camera)' : ''}<br>updated ${new Date().toLocaleTimeString()}<br>tap a totem for details`);
+  setHud(`${KUMA_MODE ? 'kuma: ' + KUMA_SLUG : 'demo: simulated monitors'}${FLAT ? ' · FLAT PREVIEW (no camera)' : ''}<br>updated ${new Date().toLocaleTimeString()}<br>tap a totem for details`);
 }
 
 // ---------- 3D ----------
@@ -188,24 +198,66 @@ function drawLabel(m) {
   ctx.beginPath(); ctx.roundRect(8, 8, canvas.width - 16, canvas.height - 16, 28); ctx.fill();
   const last = m.beats[m.beats.length - 1];
   const color = '#' + statusColor(last).toString(16).padStart(6, '0');
-  ctx.fillStyle = '#e8ecff'; ctx.font = 'bold 52px system-ui'; ctx.textAlign = 'center';
-  ctx.fillText(m.name, canvas.width / 2, 78);
-  ctx.font = '40px system-ui'; ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  ctx.font = '600 27px system-ui'; ctx.fillStyle = '#8ab4ff';
+  ctx.fillText(KIND_LABELS[m.kind] || 'MONITOR', canvas.width / 2, 44);
+  ctx.fillStyle = '#e8ecff'; ctx.font = 'bold 48px system-ui';
+  ctx.fillText(m.name, canvas.width / 2, 98);
+  ctx.font = '38px system-ui'; ctx.fillStyle = color;
   const statusWord = last == null ? 'waiting…' : (last.ok ? 'UP' : (last.pending ? 'PENDING' : 'DOWN'));
   const ping = last && last.ok ? `  ·  ${last.ms} ms` : '';
-  ctx.fillText(statusWord + ping, canvas.width / 2, 136);
+  ctx.fillText(statusWord + ping, canvas.width / 2, 148);
   ctx.fillStyle = '#93a1d6';
-  ctx.fillText(m.uptime == null ? '' : `uptime ${(m.uptime * 100).toFixed(1)}%`, canvas.width / 2, 188);
+  ctx.fillText(m.uptime == null ? '' : `uptime ${(m.uptime * 100).toFixed(1)}%`, canvas.width / 2, 196);
   texture.needsUpdate = true;
+}
+
+// Distinct 3D shape per monitor type; all status-colored materials are
+// collected so updateTotem can recolor every part at once.
+function buildStatusShape(kind) {
+  const root = new THREE.Group();
+  const mats = [];
+  const mat = () => {
+    const x = new THREE.MeshStandardMaterial({ color: COLORS.unknown, emissive: COLORS.unknown, emissiveIntensity: 0.45, roughness: 0.35 });
+    mats.push(x); return x;
+  };
+  let spin = false;
+  if (kind === 'db') {                       // stacked cylinders
+    for (let i = 0; i < 3; i++) {
+      const disk = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, 0.062, 32), mat());
+      disk.position.y = (i - 1) * 0.085;
+      root.add(disk);
+    }
+  } else if (kind === 'push') {              // beacon cone + expanding pulse ring
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.18, 32), mat());
+    root.add(cone);
+    const ringMat = mat();
+    ringMat.transparent = true;
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.12, 0.012, 12, 48), ringMat);
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = -0.07;
+    root.add(ring);
+    root.userData.pushRing = ring;
+  } else if (kind === 'ping') {              // spinning gem
+    root.add(new THREE.Mesh(new THREE.OctahedronGeometry(0.11), mat()));
+    spin = true;
+  } else if (kind === 'dns') {               // rotating torus
+    const torus = new THREE.Mesh(new THREE.TorusGeometry(0.085, 0.035, 16, 48), mat());
+    root.add(torus);
+    spin = true;
+  } else if (kind === 'tcp') {               // cube
+    root.add(new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.15, 0.15), mat()));
+    spin = true;
+  } else {                                   // api: sphere
+    root.add(new THREE.Mesh(new THREE.SphereGeometry(0.09, 32, 32), mat()));
+  }
+  root.position.y = 0.42;
+  return { root, mats, spin };
 }
 
 function makeTotem(m) {
   const group = new THREE.Group();
-  const orb = new THREE.Mesh(
-    new THREE.SphereGeometry(0.085, 32, 32),
-    new THREE.MeshStandardMaterial({ color: COLORS.unknown, emissive: COLORS.unknown, emissiveIntensity: 0.45, roughness: 0.35 })
-  );
-  orb.position.y = 0.40;
+  const shape = buildStatusShape(m.kind);
 
   const bars = [];
   const barGroup = new THREE.Group();
@@ -226,11 +278,11 @@ function makeTotem(m) {
   base.position.y = -0.01;
 
   const label = makeLabel();
-  label.sprite.position.y = 0.66;
+  label.sprite.position.y = 0.70;
 
-  group.add(base, barGroup, orb, label.sprite);
+  group.add(base, barGroup, shape.root, label.sprite);
   group.userData.monitor = m;
-  m.totem = { group, orb, bars, label };
+  m.totem = { group, status: shape.root, statusMats: shape.mats, spin: shape.spin, bars, label, baseY: shape.root.position.y };
   return group;
 }
 
@@ -238,8 +290,7 @@ function updateTotem(m) {
   if (!m.totem) return;
   const last = m.beats[m.beats.length - 1];
   const c = statusColor(last);
-  m.totem.orb.material.color.setHex(c);
-  m.totem.orb.material.emissive.setHex(c);
+  for (const mat of m.totem.statusMats) { mat.color.setHex(c); mat.emissive.setHex(c); }
 
   // newest beat on the right
   const maxMs = Math.max(300, ...m.beats.map(b => b.ms || 0));
@@ -256,9 +307,12 @@ function updateTotem(m) {
 
 function buildScene(parent) {
   const n = monitors.length;
+  const cols = Math.min(3, n);
   monitors.forEach((m, i) => {
     const totem = makeTotem(m);
-    totem.position.x = (i - (n - 1) / 2) * 0.95;
+    const col = i % cols, row = Math.floor(i / cols);
+    totem.position.x = (col - (cols - 1) / 2) * 0.95;
+    totem.position.z = row * -0.95;
     parent.add(totem);
     drawLabel(m);
   });
@@ -336,7 +390,7 @@ function renderDetail(m) {
       || (KUMA_MODE ? 'no error message — expose msg in toPublicJSON() (server/model/heartbeat.js) in your fork to see it here' : 'no error details available');
   }
 
-  const parts = [];
+  const parts = [KIND_LABELS[m.kind] || 'MONITOR'];
   const ds = downSince(m);
   if (ds) parts.push(`down for ${ds}`);
   if (m.uptime != null) parts.push(`uptime ${(m.uptime * 100).toFixed(1)}%`);
@@ -358,8 +412,15 @@ function animateTotems() {
     const last = m.beats[m.beats.length - 1];
     const down = last && !last.ok && !last.pending;
     const pulse = down ? 1 + 0.18 * Math.sin(t * 7) : 1 + 0.03 * Math.sin(t * 2);
-    m.totem.orb.scale.setScalar(pulse);
-    m.totem.orb.position.y = 0.40 + 0.012 * Math.sin(t * 1.5);
+    m.totem.status.scale.setScalar(pulse);
+    m.totem.status.position.y = m.totem.baseY + 0.012 * Math.sin(t * 1.5);
+    if (m.totem.spin) m.totem.status.rotation.y = t * 0.8;
+    const ring = m.totem.status.userData.pushRing;
+    if (ring) {                       // push monitor: ring expands outward and fades
+      const phase = (t * (down ? 2.5 : 0.8)) % 1;
+      ring.scale.setScalar(0.8 + phase * 1.4);
+      ring.material.opacity = 1 - phase;
+    }
   }
 }
 
@@ -374,9 +435,9 @@ async function startFlat() {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b1020);
   const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 50);
-  camera.position.set(0, 0.55, 1.5);
+  camera.position.set(0, 1.0, 2.3);
   const controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(0, 0.3, 0);
+  controls.target.set(0, 0.3, -0.45);
   addLights(scene);
   buildScene(scene);
   enablePicking(renderer, camera);
@@ -408,7 +469,7 @@ async function startAR() {
   addLights(scene);
   const anchor = mindar.addAnchor(0);
   const world = new THREE.Group();
-  world.scale.setScalar(0.9);
+  world.scale.setScalar(0.7);   // two rows of totems need to fit over the card
   anchor.group.add(world);
   buildScene(world);
   enablePicking(renderer, camera);

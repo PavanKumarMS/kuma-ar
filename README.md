@@ -16,7 +16,7 @@ no WebXR required. Built with [three.js](https://threejs.org/) +
 
 | Mode | URL | What it does |
 |------|-----|--------------|
-| Demo (default) | `ar.html` | Live-monitors **google.com** from the browser itself by timing `https://www.google.com/favicon.ico` image loads every 5 s, plus an intentionally broken `broken.demo` target so there's a DOWN totem to play with. No Kuma server needed. |
+| Demo (default) | `ar.html` | Six **simulated** monitors — API, database, push, ping, DNS, TCP port — polled every 2 s with fake latency profiles, random outages, and type-specific error messages. Each type has its own 3D shape: sphere (API), stacked cylinders (database), beacon cone with pulse ring (push), spinning octahedron (ping), torus (DNS), cube (TCP). No Kuma server needed. In Kuma mode the monitor `type` from the status page picks the shape automatically. |
 | Flat preview | `ar.html?flat=1` | Same 3D scene without camera/AR — for desktop testing. Orbit with the mouse. |
 | Kuma | `ar.html?base=https://your-kuma&slug=ar` | Polls a real Uptime Kuma **status page**: `/api/status-page/heartbeat/<slug>` + `/api/status-page/<slug>`. Add monitors to that status page to choose what appears in AR. |
 
