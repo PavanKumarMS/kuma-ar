@@ -54,6 +54,14 @@
     padding: 10px 16px; border-radius: 999px; border: 1px solid #2c3a6b; cursor: pointer;
     background: rgba(10, 14, 30, .85); color: #dbe2ff; font-weight: 600; font-size: 14px;
   }
+  #detail-hsummary { margin-top: 12px; font-size: 13px; color: #93a1d6; }
+  #detail-hbar { display: flex; gap: 1px; margin-top: 6px; height: 26px; }
+  .hseg { flex: 1; border-radius: 2px; cursor: pointer; background: #1c4d33; }
+  .hseg.partial { background: #b45309; }
+  .hseg.down { background: #b91c1c; }
+  .hseg.sel { outline: 2px solid #8ab4ff; outline-offset: 1px; }
+  #detail-hinfo { margin-top: 8px; font-size: 13px; color: #93a1d6; min-height: 18px; }
+  #detail-hinfo .herr { color: #ffb4b4; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -64,6 +72,11 @@
   <div id="detail-status"></div>
   <div id="detail-error"></div>
   <div id="detail-meta"></div>
+  <div id="detail-history">
+    <div id="detail-hsummary"></div>
+    <div id="detail-hbar"></div>
+    <div id="detail-hinfo"></div>
+  </div>
   <button id="detail-recheck">Re-check now</button>
 </div>
 <button id="ar-toggle" hidden>⏸ Pause scan</button>
@@ -128,6 +141,7 @@ async function initMonitors() {
       { id: 'dns',  name: 'internal-dns',     kind: 'dns',  sim: { base: 35,  jitter: 28, errMsg: 'queryA ENOTFOUND api.internal' } },
       { id: 'tcp',  name: 'redis-cache:6379', kind: 'tcp',  sim: { base: 9,   jitter: 7,  errMsg: 'connect ETIMEDOUT 10.0.0.8:6379' } },
     ].map(m => ({ ...m, beats: [], uptime: null, simState: { down: false, left: 0 } }));
+    monitors.forEach(genHistory24h);
     return;
   }
   const cfg = await (await fetch(`${KUMA_BASE}/api/status-page/${KUMA_SLUG}`)).json();
@@ -151,6 +165,32 @@ function simulateBeat(m) {
   const spike = Math.random() < 0.07 ? 2.5 : 1;
   const ms = ok ? Math.round((m.sim.base + Math.random() * m.sim.jitter) * spike) : 0;
   return { ok, pending: false, ms, msg: ok ? '' : m.sim.errMsg, at: Date.now() };
+}
+
+// Fake 24 h history: 48 half-hour buckets with 1–4 random incidents.
+function genHistory24h(m) {
+  const now = Date.now();
+  const incidents = [];
+  const nInc = 1 + Math.floor(Math.random() * 4);
+  for (let k = 0; k < nInc; k++) {
+    const start = now - Math.random() * 24 * 3600e3;
+    incidents.push({ start, end: start + (5 + Math.random() * 55) * 60e3 });
+  }
+  m.history = [];
+  for (let i = 0; i < 48; i++) {
+    const bStart = now - (48 - i) * 30 * 60e3;
+    const bEnd = bStart + 30 * 60e3;
+    const hit = incidents.find(inc => inc.start < bEnd && inc.end > bStart);
+    const downMs = hit ? Math.min(bEnd, hit.end) - Math.max(bStart, hit.start) : 0;
+    const downMin = Math.round(downMs / 60e3);
+    m.history.push({
+      start: bStart, end: bEnd, downMin,
+      status: downMin >= 25 ? 'down' : downMin > 0 ? 'partial' : 'up',
+      avgMs: Math.round(m.sim.base + Math.random() * m.sim.jitter),
+      msg: downMin > 0 ? m.sim.errMsg : '',
+      errAt: hit ? Math.max(bStart, hit.start) : null,
+    });
+  }
 }
 
 async function pollOnce() {
@@ -306,16 +346,16 @@ function updateTotem(m) {
 }
 
 function buildScene(parent) {
+  // Single scrollable row — swipe left/right (AR) or orbit (flat) to browse.
   const n = monitors.length;
-  const cols = Math.min(3, n);
+  const SPACING = 0.95;
   monitors.forEach((m, i) => {
     const totem = makeTotem(m);
-    const col = i % cols, row = Math.floor(i / cols);
-    totem.position.x = (col - (cols - 1) / 2) * 0.95;
-    totem.position.z = row * -0.95;
+    totem.position.x = (i - (n - 1) / 2) * SPACING;
     parent.add(totem);
     drawLabel(m);
   });
+  scrollMax = ((n - 1) / 2) * SPACING;
 }
 
 function addLights(scene) {
@@ -331,19 +371,47 @@ let activeRenderer = null, activeCamera = null;
 const raycaster = new THREE.Raycaster();
 const detailEl = document.getElementById('detail');
 
-function enablePicking(renderer, camera) {
+// Swipe-to-pan state (AR mode): drag left/right slides the totem row.
+let scrollGroup = null, scrollX = 0, scrollTargetX = 0, scrollMax = 0;
+let gesturesEnabled = false;
+let pressInfo = null;
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+function enableInteraction(renderer, camera) {
   activeRenderer = renderer; activeCamera = camera;
   // Listen on window, not the canvas: in AR mode MindAR layers its camera
-  // <video> above the canvas and would swallow taps.
-  window.addEventListener('pointerdown', onPick);
+  // <video> above the canvas and would swallow events.
+  window.addEventListener('pointerdown', onPointerDown);
+  window.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerup', onPointerUp);
 }
 
-function onPick(e) {
+function onPointerDown(e) {
   if (e.target.closest && e.target.closest('#detail, #hud, #start-screen, #ar-toggle')) return;
+  pressInfo = { x: e.clientX, y: e.clientY, lastX: e.clientX, t: performance.now(), moved: false };
+}
+
+function onPointerMove(e) {
+  if (!pressInfo) return;
+  if (Math.abs(e.clientX - pressInfo.x) > 8 || Math.abs(e.clientY - pressInfo.y) > 8) pressInfo.moved = true;
+  if (gesturesEnabled && scrollGroup) {
+    scrollTargetX = clamp(scrollTargetX + (e.clientX - pressInfo.lastX) * 0.006, -scrollMax, scrollMax);
+  }
+  pressInfo.lastX = e.clientX;
+}
+
+function onPointerUp(e) {
+  if (!pressInfo) return;
+  const isTap = !pressInfo.moved && performance.now() - pressInfo.t < 600;
+  pressInfo = null;
+  if (isTap) pickAt(e.clientX, e.clientY);
+}
+
+function pickAt(cx, cy) {
   const rect = activeRenderer.domElement.getBoundingClientRect();
   const ndc = new THREE.Vector2(
-    ((e.clientX - rect.left) / rect.width) * 2 - 1,
-    -((e.clientY - rect.top) / rect.height) * 2 + 1
+    ((cx - rect.left) / rect.width) * 2 - 1,
+    -((cy - rect.top) / rect.height) * 2 + 1
   );
   raycaster.setFromCamera(ndc, activeCamera);
   const groups = monitors.filter(m => m.totem).map(m => m.totem.group);
@@ -396,7 +464,42 @@ function renderDetail(m) {
   if (m.uptime != null) parts.push(`uptime ${(m.uptime * 100).toFixed(1)}%`);
   parts.push(`${m.beats.length} checks in window`);
   document.getElementById('detail-meta').textContent = parts.join('  ·  ');
+  renderHistory(m);
 }
+
+function renderHistory(m) {
+  const wrap = document.getElementById('detail-history');
+  if (!m.history) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+  const downMin = m.history.reduce((a, b) => a + b.downMin, 0);
+  let incidents = 0;
+  for (let i = 0; i < m.history.length; i++) {
+    if (m.history[i].downMin > 0 && (i === 0 || m.history[i - 1].downMin === 0)) incidents++;
+  }
+  document.getElementById('detail-hsummary').textContent =
+    `last 24 h: ${(100 * (1 - downMin / 1440)).toFixed(1)}% up · ${incidents} incident${incidents === 1 ? '' : 's'} · ${downMin} min down`;
+  document.getElementById('detail-hbar').innerHTML = m.history
+    .map((b, i) => `<div class="hseg ${b.status}${m.histSel === i ? ' sel' : ''}" data-i="${i}"></div>`)
+    .join('');
+  renderHistoryInfo(m);
+}
+
+function renderHistoryInfo(m) {
+  const el = document.getElementById('detail-hinfo');
+  if (m.histSel == null) { el.textContent = 'tap a segment to inspect that moment'; return; }
+  const b = m.history[m.histSel];
+  const fmt = ts => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  el.innerHTML = b.downMin > 0
+    ? `<b>${fmt(b.start)}–${fmt(b.end)}</b> · DOWN ${b.downMin} min (from ${fmt(b.errAt)}) · <span class="herr">${b.msg}</span>`
+    : `<b>${fmt(b.start)}–${fmt(b.end)}</b> · UP · avg ${b.avgMs} ms`;
+}
+
+document.getElementById('detail-hbar').addEventListener('click', e => {
+  const i = e.target.dataset && e.target.dataset.i;
+  if (i == null || !selectedMonitor) return;
+  selectedMonitor.histSel = +i;
+  renderHistory(selectedMonitor);
+});
 
 document.getElementById('detail-close').onclick = () => { detailEl.hidden = true; selectedMonitor = null; };
 document.getElementById('detail-recheck').onclick = e => {
@@ -407,6 +510,10 @@ document.getElementById('detail-recheck').onclick = e => {
 const clock = new THREE.Clock();
 function animateTotems() {
   const t = clock.getElapsedTime();
+  if (scrollGroup) {
+    scrollX += (scrollTargetX - scrollX) * 0.15;
+    scrollGroup.position.x = scrollX;
+  }
   for (const m of monitors) {
     if (!m.totem) continue;
     const last = m.beats[m.beats.length - 1];
@@ -435,12 +542,14 @@ async function startFlat() {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b1020);
   const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 50);
-  camera.position.set(0, 1.0, 2.3);
+  camera.position.set(0, 0.8, 3.4);
   const controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(0, 0.3, -0.45);
+  controls.target.set(0, 0.35, 0);
   addLights(scene);
-  buildScene(scene);
-  enablePicking(renderer, camera);
+  scrollGroup = new THREE.Group();
+  scene.add(scrollGroup);
+  buildScene(scrollGroup);
+  enableInteraction(renderer, camera);
   addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
@@ -469,11 +578,14 @@ async function startAR() {
   addLights(scene);
   const anchor = mindar.addAnchor(0);
   const world = new THREE.Group();
-  world.scale.setScalar(0.7);   // two rows of totems need to fit over the card
+  world.scale.setScalar(0.8);
   anchor.group.add(world);
-  buildScene(world);
-  enablePicking(renderer, camera);
-  anchor.onTargetFound = () => setHud('marker locked — tap a totem for details');
+  scrollGroup = new THREE.Group();
+  world.add(scrollGroup);
+  buildScene(scrollGroup);
+  enableInteraction(renderer, camera);
+  gesturesEnabled = true;
+  anchor.onTargetFound = () => setHud('marker locked — tap a totem, swipe to pan');
   anchor.onTargetLost = () => setHud('scanning for marker…');
   const runLoop = () => renderer.setAnimationLoop(() => { animateTotems(); renderer.render(scene, camera); });
   await mindar.start();

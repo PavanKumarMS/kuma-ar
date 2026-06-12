@@ -42,12 +42,23 @@ localhost). Easiest options:
 Then: open `marker.html` on your desktop (or print the card), open `ar.html`
 on the phone, tap **Start AR**, allow camera, aim at the card.
 
+## Gestures
+
+- **Tap** a totem → detail card (tap is press+release without movement).
+- **Swipe left/right** (AR mode) → pans the totem row side to side.
+- In flat preview, drag orbits the camera instead (OrbitControls).
+
 ## Tap to inspect
 
 Tapping/clicking any totem opens a detail card: status, the error message (in
 a red box when DOWN), how long it has been down (computed from the heartbeat
 window — `≥` means the outage started before the visible window), uptime, and
 a **Re-check now** button that forces an immediate poll.
+
+The card also shows a **24 h timeline** (demo mode: simulated): 48 half-hour
+segments colored up/partial/down, a summary line (uptime %, incident count,
+minutes down), and tapping a segment shows what happened in that window —
+including the error message and when the outage started.
 
 **Error messages in Kuma mode:** the public status-page API deliberately blanks
 the heartbeat `msg` field — see `server/model/heartbeat.js` `toPublicJSON()`
