@@ -54,6 +54,17 @@
     padding: 10px 16px; border-radius: 999px; border: 1px solid #2c3a6b; cursor: pointer;
     background: rgba(10, 14, 30, .85); color: #dbe2ff; font-weight: 600; font-size: 14px;
   }
+  #rec-btn {
+    position: fixed; right: 12px; top: 60px; z-index: 26;
+    padding: 10px 16px; border-radius: 999px; border: 1px solid #2c3a6b; cursor: pointer;
+    background: rgba(10, 14, 30, .85); color: #dbe2ff; font-weight: 600; font-size: 14px;
+  }
+  #rec-btn.on { background: #b91c1c; border-color: #ef4444; }
+  #cam-select {
+    position: fixed; right: 12px; top: 108px; z-index: 26; max-width: 46vw;
+    padding: 8px 12px; border-radius: 999px; border: 1px solid #2c3a6b;
+    background: rgba(10, 14, 30, .85); color: #dbe2ff; font-size: 13px;
+  }
   #detail-hsummary { margin-top: 12px; font-size: 13px; color: #93a1d6; }
   #detail-hbar { display: flex; gap: 1px; margin-top: 6px; height: 26px; }
   .hseg { flex: 1; border-radius: 2px; cursor: pointer; background: #1c4d33; }
@@ -80,6 +91,8 @@
   <button id="detail-recheck">Re-check now</button>
 </div>
 <button id="ar-toggle" hidden>⏸ Pause scan</button>
+<button id="rec-btn" hidden>⏺ Record</button>
+<select id="cam-select" hidden></select>
 <div id="start-screen">
   <h1>Kuma AR</h1>
   <p>Point your camera at the marker card after starting. Live status pops up as 3D totems.</p>
@@ -311,16 +324,10 @@ function makeTotem(m) {
     barGroup.add(bar); bars.push(bar);
   }
 
-  const base = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.42, 0.42, 0.012, 48),
-    new THREE.MeshStandardMaterial({ color: 0x16204a, roughness: 0.8, transparent: true, opacity: 0.55 })
-  );
-  base.position.y = -0.01;
-
   const label = makeLabel();
   label.sprite.position.y = 0.70;
 
-  group.add(base, barGroup, shape.root, label.sprite);
+  group.add(barGroup, shape.root, label.sprite);
   group.userData.monitor = m;
   m.totem = { group, status: shape.root, statusMats: shape.mats, spin: shape.spin, bars, label, baseY: shape.root.position.y };
   return group;
@@ -346,16 +353,18 @@ function updateTotem(m) {
 }
 
 function buildScene(parent) {
-  // Single scrollable row — swipe left/right (AR) or orbit (flat) to browse.
-  const n = monitors.length;
-  const SPACING = 0.95;
+  // 3×2 grid so every monitor fits over an A4 marker at once;
+  // swipe still nudges the group a little for a better look.
+  const cols = 3, SX = 1.0, SZ = 1.1;
   monitors.forEach((m, i) => {
     const totem = makeTotem(m);
-    totem.position.x = (i - (n - 1) / 2) * SPACING;
+    const col = i % cols, row = Math.floor(i / cols);
+    totem.position.x = (col - (cols - 1) / 2) * SX;
+    totem.position.z = row * -SZ;
     parent.add(totem);
     drawLabel(m);
   });
-  scrollMax = ((n - 1) / 2) * SPACING;
+  scrollMax = 0.6;
 }
 
 function addLights(scene) {
@@ -507,6 +516,92 @@ document.getElementById('detail-recheck').onclick = e => {
   pollOnce().catch(err => setHud('poll failed: ' + err.message, true)).finally(() => { e.target.disabled = false; });
 };
 
+// ---------- lens / camera selection ----------
+// MindAR always requests the default back camera, so we wrap getUserMedia:
+// when a specific camera is chosen, its deviceId replaces the constraints.
+let selectedCameraId = '';
+const origGUM = navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+  ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices) : null;
+if (origGUM) {
+  navigator.mediaDevices.getUserMedia = constraints => {
+    if (selectedCameraId && constraints && constraints.video) {
+      const v = typeof constraints.video === 'object' ? { ...constraints.video } : {};
+      delete v.facingMode;
+      v.deviceId = { exact: selectedCameraId };
+      constraints = { ...constraints, video: v };
+    }
+    return origGUM(constraints);
+  };
+}
+
+async function populateCameras() {
+  const sel = document.getElementById('cam-select');
+  try {
+    const cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+    sel.innerHTML = '<option value="">default camera</option>' +
+      cams.map((c, i) => `<option value="${c.deviceId}">${c.label || 'camera ' + (i + 1)}</option>`).join('');
+    sel.hidden = cams.length < 2;
+  } catch { sel.hidden = true; }
+}
+
+// ---------- screen recording ----------
+// Records a composite of the camera video + 3D canvas. The composite is
+// painted inside the render loop (recordFrame) because reading a WebGL
+// canvas is only reliable in the same frame it was rendered.
+let recorder = null, recChunks = [], recCanvas = null, recCtx = null;
+
+function startRecording() {
+  const container = document.getElementById('ar-container');
+  recCanvas = document.createElement('canvas');
+  recCanvas.width = container.clientWidth;
+  recCanvas.height = container.clientHeight;
+  recCtx = recCanvas.getContext('2d');
+  const stream = recCanvas.captureStream(30);
+  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+  recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 6e6 });
+  recChunks = [];
+  recorder.ondataavailable = e => { if (e.data.size) recChunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(recChunks, { type: 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'kuma-ar-' + new Date().toISOString().replace(/[:.]/g, '-') + '.webm';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  };
+  recorder.start();
+}
+
+function recordFrame() {
+  if (!recorder || recorder.state !== 'recording') return;
+  const container = document.getElementById('ar-container');
+  const video = container.querySelector('video');
+  const glCanvas = container.querySelector('canvas');
+  recCtx.fillStyle = '#0b1020';
+  recCtx.fillRect(0, 0, recCanvas.width, recCanvas.height);
+  if (video && video.videoWidth) {   // camera feed, cover-fit like on screen
+    const s = Math.max(recCanvas.width / video.videoWidth, recCanvas.height / video.videoHeight);
+    const dw = video.videoWidth * s, dh = video.videoHeight * s;
+    recCtx.drawImage(video, (recCanvas.width - dw) / 2, (recCanvas.height - dh) / 2, dw, dh);
+  }
+  if (glCanvas) recCtx.drawImage(glCanvas, 0, 0, recCanvas.width, recCanvas.height);
+}
+
+const recBtn = document.getElementById('rec-btn');
+recBtn.onclick = () => {
+  if (recorder) {
+    if (recorder.state !== 'inactive') recorder.stop();
+    recorder = null;
+    recBtn.textContent = '⏺ Record';
+    recBtn.classList.remove('on');
+    setHud('recording saved — check your downloads');
+  } else {
+    startRecording();
+    recBtn.textContent = '⏹ Stop rec';
+    recBtn.classList.add('on');
+  }
+};
+
 const clock = new THREE.Clock();
 function animateTotems() {
   const t = clock.getElapsedTime();
@@ -542,9 +637,9 @@ async function startFlat() {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b1020);
   const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 50);
-  camera.position.set(0, 0.8, 3.4);
+  camera.position.set(0, 2.4, 2.9);
   const controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(0, 0.35, 0);
+  controls.target.set(0, 0.1, -0.55);
   addLights(scene);
   scrollGroup = new THREE.Group();
   scene.add(scrollGroup);
@@ -554,7 +649,8 @@ async function startFlat() {
     camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
   });
-  renderer.setAnimationLoop(() => { animateTotems(); controls.update(); renderer.render(scene, camera); });
+  document.getElementById('rec-btn').hidden = false;
+  renderer.setAnimationLoop(() => { animateTotems(); controls.update(); renderer.render(scene, camera); recordFrame(); });
 }
 
 async function startAR() {
@@ -587,10 +683,25 @@ async function startAR() {
   gesturesEnabled = true;
   anchor.onTargetFound = () => setHud('marker locked — tap a totem, swipe to pan');
   anchor.onTargetLost = () => setHud('scanning for marker…');
-  const runLoop = () => renderer.setAnimationLoop(() => { animateTotems(); renderer.render(scene, camera); });
+  const runLoop = () => renderer.setAnimationLoop(() => { animateTotems(); renderer.render(scene, camera); recordFrame(); });
   await mindar.start();
   runLoop();
   setHud('scanning for marker…');
+  document.getElementById('rec-btn').hidden = false;
+  populateCameras();   // labels are available now that permission is granted
+  document.getElementById('cam-select').onchange = async e => {
+    selectedCameraId = e.target.value;
+    setHud('switching camera…');
+    try {
+      mindar.stop();
+      renderer.setAnimationLoop(null);
+      await mindar.start();
+      runLoop();
+      setHud('scanning for marker…');
+    } catch (err) {
+      setHud('camera switch failed: ' + err.message, true);
+    }
+  };
 
   const toggleBtn = document.getElementById('ar-toggle');
   toggleBtn.hidden = false;
