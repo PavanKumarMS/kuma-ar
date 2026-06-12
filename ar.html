@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Kuma AR — monitor totems</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b1020; overflow: hidden; font-family: system-ui, sans-serif; }
+  #ar-container { width: 100%; height: 100%; position: absolute; inset: 0; }
+  #hud {
+    position: fixed; top: 10px; left: 10px; z-index: 20;
+    background: rgba(10, 14, 30, .75); color: #dbe2ff; border: 1px solid #2c3a6b;
+    border-radius: 10px; padding: 8px 12px; font-size: 13px; line-height: 1.5; max-width: 75vw;
+  }
+  #hud .err { color: #ff7b7b; }
+  #start-screen {
+    position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px;
+    background: radial-gradient(circle at 50% 35%, #16204a, #0b1020 70%); color: #dbe2ff;
+  }
+  #start-screen h1 { font-size: 22px; margin: 0; font-weight: 600; }
+  #start-screen p { margin: 0; font-size: 14px; color: #93a1d6; text-align: center; max-width: 320px; }
+  #start-btn {
+    font-size: 18px; padding: 14px 36px; border-radius: 999px; border: none; cursor: pointer;
+    background: #4ade80; color: #07210f; font-weight: 700;
+  }
+  #flat-link { color: #8ab4ff; font-size: 13px; }
+  #detail {
+    position: fixed; left: 50%; transform: translateX(-50%); bottom: 14px; z-index: 25;
+    width: min(440px, calc(100vw - 24px)); box-sizing: border-box;
+    background: rgba(10, 14, 30, .93); border: 1px solid #2c3a6b; border-radius: 14px;
+    color: #dbe2ff; padding: 14px 16px; font-size: 14px; line-height: 1.55;
+  }
+  #detail-head { display: flex; align-items: center; justify-content: space-between; }
+  #detail-name { font-size: 17px; font-weight: 700; }
+  #detail-close { background: none; border: none; color: #93a1d6; font-size: 18px; cursor: pointer; padding: 2px 6px; }
+  #detail-status { font-weight: 700; margin-top: 2px; }
+  #detail-error {
+    margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: rgba(239, 68, 68, .12);
+    border: 1px solid rgba(239, 68, 68, .4); color: #ffb4b4;
+    font-family: ui-monospace, Consolas, monospace; font-size: 13px; word-break: break-word;
+  }
+  #detail-error.ok { display: none; }
+  #detail-meta { margin-top: 8px; color: #93a1d6; font-size: 13px; }
+  #detail-recheck {
+    margin-top: 10px; width: 100%; padding: 10px; border-radius: 9px; border: none; cursor: pointer;
+    background: #2c3a6b; color: #dbe2ff; font-weight: 600; font-size: 14px;
+  }
+</style>
+</head>
+<body>
+<div id="ar-container"></div>
+<div id="hud">starting…</div>
+<div id="detail" hidden>
+  <div id="detail-head"><span id="detail-name"></span><button id="detail-close">✕</button></div>
+  <div id="detail-status"></div>
+  <div id="detail-error"></div>
+  <div id="detail-meta"></div>
+  <button id="detail-recheck">Re-check now</button>
+</div>
+<div id="start-screen">
+  <h1>Kuma AR</h1>
+  <p>Point your camera at the marker card after starting. Live status pops up as 3D totems.</p>
+  <button id="start-btn">Start AR</button>
+  <a id="flat-link" href="?flat=1">No camera? Open flat 3D preview</a>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+const MIND_TARGET = 'https://cdn.jsdelivr.net/gh/hiukim/mind-ar-js@1.2.5/examples/image-tracking/assets/card-example/card.mind';
+const HISTORY = 30;          // heartbeats kept per monitor
+const POLL_MS = 5000;
+
+const params = new URLSearchParams(location.search);
+const FLAT = params.has('flat');                  // desktop preview, no camera
+const KUMA_BASE = params.get('base');             // e.g. https://kuma.example.com
+const KUMA_SLUG = params.get('slug');             // status page slug
+const KUMA_MODE = !!(KUMA_BASE && KUMA_SLUG);
+
+const hud = document.getElementById('hud');
+const startScreen = document.getElementById('start-screen');
+const setHud = (msg, isErr) => { hud.innerHTML = isErr ? `<span class="err">${msg}</span>` : msg; };
+
+const COLORS = { up: 0x22c55e, down: 0xef4444, pending: 0xf59e0b, unknown: 0x6b7280 };
+const statusColor = b => b == null ? COLORS.unknown : (b.ok ? COLORS.up : (b.pending ? COLORS.pending : COLORS.down));
+
+// ---------- monitors ----------
+// Each monitor: { id, name, beats: [{ok, pending, ms}], uptime: 0..1|null, totem }
+let monitors = [];
+
+async function initMonitors() {
+  if (!KUMA_MODE) {
+    // Demo mode: "monitor" google.com straight from the browser.
+    // <img> loads aren't blocked by CORS, so favicon load time ≈ reachability + latency.
+    // The second target is intentionally broken so there's a DOWN totem to tap.
+    monitors = [
+      { id: 'google', name: 'google.com', pingUrl: 'https://www.google.com/favicon.ico', beats: [], uptime: null },
+      { id: 'broken', name: 'broken.demo', pingUrl: 'https://nonexistent-host.invalid/favicon.ico', beats: [], uptime: null },
+    ];
+    return;
+  }
+  const cfg = await (await fetch(`${KUMA_BASE}/api/status-page/${KUMA_SLUG}`)).json();
+  monitors = (cfg.publicGroupList || []).flatMap(g => g.monitorList || [])
+    .map(m => ({ id: m.id, name: m.name, beats: [], uptime: null }));
+  if (!monitors.length) throw new Error('status page has no monitors');
+}
+
+function pingViaImage(url, timeoutMs = 8000) {
+  return new Promise(resolve => {
+    const start = performance.now();
+    const img = new Image();
+    let done = false;
+    const finish = (ok, msg) => {
+      if (done) return;
+      done = true;
+      resolve({ ok, pending: false, ms: Math.round(performance.now() - start), msg: msg || '', at: Date.now() });
+    };
+    const timer = setTimeout(() => finish(false, `timed out after ${timeoutMs} ms`), timeoutMs);
+    img.onload = () => { clearTimeout(timer); finish(true); };
+    img.onerror = () => { clearTimeout(timer); finish(false, 'connection failed (DNS error / refused / blocked) — browser hides the exact cause; Kuma mode shows the real error'); };
+    img.src = url + '?cachebust=' + performance.now();
+  });
+}
+
+async function pollOnce() {
+  if (KUMA_MODE) {
+    const data = await (await fetch(`${KUMA_BASE}/api/status-page/heartbeat/${KUMA_SLUG}`)).json();
+    for (const m of monitors) {
+      const list = (data.heartbeatList && data.heartbeatList[m.id]) || [];
+      m.beats = list.slice(-HISTORY).map(h => ({
+        ok: h.status === 1,
+        pending: h.status === 2 || h.status === 3,
+        ms: h.ping || 0,
+        msg: h.msg || '',   // empty unless the fork exposes it (heartbeat.js toPublicJSON)
+        at: h.time ? Date.parse(h.time.replace(' ', 'T') + 'Z') : null,
+      }));
+      const up = data.uptimeList && data.uptimeList[`${m.id}_24`];
+      m.uptime = typeof up === 'number' ? up : null;
+    }
+  } else {
+    for (const m of monitors) {
+      const beat = await pingViaImage(m.pingUrl);
+      m.beats.push(beat);
+      if (m.beats.length > HISTORY) m.beats.shift();
+      m.uptime = m.beats.filter(b => b.ok).length / m.beats.length;
+    }
+  }
+  monitors.forEach(updateTotem);
+  if (selectedMonitor) renderDetail(selectedMonitor);
+  setHud(`${KUMA_MODE ? 'kuma: ' + KUMA_SLUG : 'demo: live-pinging google.com'}<br>updated ${new Date().toLocaleTimeString()}<br>tap a totem for details`);
+}
+
+// ---------- 3D ----------
+function makeLabel() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512; canvas.height = 224;
+  const texture = new THREE.CanvasTexture(canvas);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false }));
+  sprite.scale.set(0.62, 0.27, 1);
+  return { sprite, canvas, texture };
+}
+
+function drawLabel(m) {
+  const { canvas, texture } = m.totem.label;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = 'rgba(8, 12, 28, 0.78)';
+  ctx.beginPath(); ctx.roundRect(8, 8, canvas.width - 16, canvas.height - 16, 28); ctx.fill();
+  const last = m.beats[m.beats.length - 1];
+  const color = '#' + statusColor(last).toString(16).padStart(6, '0');
+  ctx.fillStyle = '#e8ecff'; ctx.font = 'bold 52px system-ui'; ctx.textAlign = 'center';
+  ctx.fillText(m.name, canvas.width / 2, 78);
+  ctx.font = '40px system-ui'; ctx.fillStyle = color;
+  const statusWord = last == null ? 'waiting…' : (last.ok ? 'UP' : (last.pending ? 'PENDING' : 'DOWN'));
+  const ping = last && last.ok ? `  ·  ${last.ms} ms` : '';
+  ctx.fillText(statusWord + ping, canvas.width / 2, 136);
+  ctx.fillStyle = '#93a1d6';
+  ctx.fillText(m.uptime == null ? '' : `uptime ${(m.uptime * 100).toFixed(1)}%`, canvas.width / 2, 188);
+  texture.needsUpdate = true;
+}
+
+function makeTotem(m) {
+  const group = new THREE.Group();
+  const orb = new THREE.Mesh(
+    new THREE.SphereGeometry(0.085, 32, 32),
+    new THREE.MeshStandardMaterial({ color: COLORS.unknown, emissive: COLORS.unknown, emissiveIntensity: 0.45, roughness: 0.35 })
+  );
+  orb.position.y = 0.40;
+
+  const bars = [];
+  const barGroup = new THREE.Group();
+  for (let i = 0; i < HISTORY; i++) {
+    const bar = new THREE.Mesh(
+      new THREE.BoxGeometry(0.016, 1, 0.016),
+      new THREE.MeshStandardMaterial({ color: 0x3a4470 })
+    );
+    bar.position.x = (i - (HISTORY - 1) / 2) * 0.024;
+    bar.scale.y = 0.02; bar.position.y = 0.01;
+    barGroup.add(bar); bars.push(bar);
+  }
+
+  const base = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.42, 0.42, 0.012, 48),
+    new THREE.MeshStandardMaterial({ color: 0x16204a, roughness: 0.8, transparent: true, opacity: 0.55 })
+  );
+  base.position.y = -0.01;
+
+  const label = makeLabel();
+  label.sprite.position.y = 0.66;
+
+  group.add(base, barGroup, orb, label.sprite);
+  group.userData.monitor = m;
+  m.totem = { group, orb, bars, label };
+  return group;
+}
+
+function updateTotem(m) {
+  if (!m.totem) return;
+  const last = m.beats[m.beats.length - 1];
+  const c = statusColor(last);
+  m.totem.orb.material.color.setHex(c);
+  m.totem.orb.material.emissive.setHex(c);
+
+  // newest beat on the right
+  const maxMs = Math.max(300, ...m.beats.map(b => b.ms || 0));
+  for (let i = 0; i < HISTORY; i++) {
+    const beat = m.beats[m.beats.length - HISTORY + i];
+    const bar = m.totem.bars[i];
+    if (!beat) { bar.material.color.setHex(0x3a4470); bar.scale.y = 0.02; bar.position.y = 0.01; continue; }
+    const h = beat.ok ? 0.04 + 0.26 * Math.min(1, beat.ms / maxMs) : 0.30;
+    bar.scale.y = h; bar.position.y = h / 2;
+    bar.material.color.setHex(statusColor(beat));
+  }
+  drawLabel(m);
+}
+
+function buildScene(parent) {
+  const n = monitors.length;
+  monitors.forEach((m, i) => {
+    const totem = makeTotem(m);
+    totem.position.x = (i - (n - 1) / 2) * 0.95;
+    parent.add(totem);
+    drawLabel(m);
+  });
+}
+
+function addLights(scene) {
+  scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+  const dir = new THREE.DirectionalLight(0xffffff, 1.4);
+  dir.position.set(0.5, 1, 1);
+  scene.add(dir);
+}
+
+// ---------- tap-to-inspect ----------
+let selectedMonitor = null;
+let activeRenderer = null, activeCamera = null;
+const raycaster = new THREE.Raycaster();
+const detailEl = document.getElementById('detail');
+
+function enablePicking(renderer, camera) {
+  activeRenderer = renderer; activeCamera = camera;
+  renderer.domElement.addEventListener('pointerdown', onPick);
+}
+
+function onPick(e) {
+  const rect = activeRenderer.domElement.getBoundingClientRect();
+  const ndc = new THREE.Vector2(
+    ((e.clientX - rect.left) / rect.width) * 2 - 1,
+    -((e.clientY - rect.top) / rect.height) * 2 + 1
+  );
+  raycaster.setFromCamera(ndc, activeCamera);
+  const groups = monitors.filter(m => m.totem).map(m => m.totem.group);
+  const hits = raycaster.intersectObjects(groups, true);
+  if (!hits.length) return;
+  let obj = hits[0].object;
+  while (obj && !obj.userData.monitor) obj = obj.parent;
+  if (obj) { selectedMonitor = obj.userData.monitor; renderDetail(selectedMonitor); detailEl.hidden = false; }
+}
+
+function fmtDuration(ms) {
+  const s = Math.round(ms / 1000);
+  if (s < 90) return `${s} s`;
+  const min = Math.round(s / 60);
+  if (min < 90) return `${min} min`;
+  return `${(min / 60).toFixed(1)} h`;
+}
+
+// Length of the current DOWN streak, from the beat history window.
+function downSince(m) {
+  const beats = m.beats;
+  if (!beats.length || beats[beats.length - 1].ok) return null;
+  let i = beats.length - 1;
+  while (i > 0 && !beats[i - 1].ok) i--;
+  const startedAt = beats[i].at;
+  if (!startedAt) return null;
+  const prefix = i === 0 ? '≥ ' : '';      // whole window is down — actual start is older
+  return prefix + fmtDuration(Date.now() - startedAt);
+}
+
+function renderDetail(m) {
+  const last = m.beats[m.beats.length - 1];
+  const color = '#' + statusColor(last).toString(16).padStart(6, '0');
+  document.getElementById('detail-name').textContent = m.name;
+  const statusEl = document.getElementById('detail-status');
+  statusEl.style.color = color;
+  statusEl.textContent = last == null ? 'waiting for first check…' : (last.ok ? `UP · ${last.ms} ms` : (last.pending ? 'PENDING / MAINTENANCE' : 'DOWN'));
+
+  const errEl = document.getElementById('detail-error');
+  const isDown = last && !last.ok && !last.pending;
+  errEl.classList.toggle('ok', !isDown);
+  if (isDown) {
+    errEl.textContent = last.msg
+      || (KUMA_MODE ? 'no error message — expose msg in toPublicJSON() (server/model/heartbeat.js) in your fork to see it here' : 'no error details available');
+  }
+
+  const parts = [];
+  const ds = downSince(m);
+  if (ds) parts.push(`down for ${ds}`);
+  if (m.uptime != null) parts.push(`uptime ${(m.uptime * 100).toFixed(1)}%`);
+  parts.push(`${m.beats.length} checks in window`);
+  document.getElementById('detail-meta').textContent = parts.join('  ·  ');
+}
+
+document.getElementById('detail-close').onclick = () => { detailEl.hidden = true; selectedMonitor = null; };
+document.getElementById('detail-recheck').onclick = e => {
+  e.target.disabled = true;
+  pollOnce().catch(err => setHud('poll failed: ' + err.message, true)).finally(() => { e.target.disabled = false; });
+};
+
+const clock = new THREE.Clock();
+function animateTotems() {
+  const t = clock.getElapsedTime();
+  for (const m of monitors) {
+    if (!m.totem) continue;
+    const last = m.beats[m.beats.length - 1];
+    const down = last && !last.ok && !last.pending;
+    const pulse = down ? 1 + 0.18 * Math.sin(t * 7) : 1 + 0.03 * Math.sin(t * 2);
+    m.totem.orb.scale.setScalar(pulse);
+    m.totem.orb.position.y = 0.40 + 0.012 * Math.sin(t * 1.5);
+  }
+}
+
+// ---------- bootstrap ----------
+async function startFlat() {
+  startScreen.style.display = 'none';
+  const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(devicePixelRatio);
+  document.getElementById('ar-container').appendChild(renderer.domElement);
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b1020);
+  const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 50);
+  camera.position.set(0, 0.55, 1.5);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 0.3, 0);
+  addLights(scene);
+  buildScene(scene);
+  enablePicking(renderer, camera);
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+  renderer.setAnimationLoop(() => { animateTotems(); controls.update(); renderer.render(scene, camera); });
+}
+
+async function startAR() {
+  // Browsers only allow camera access on secure origins; MindAR's own error
+  // screen for this case misleadingly says the device is incompatible.
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    setHud(`Camera blocked: this page was opened over HTTP (${location.origin}).<br>` +
+      'Phones need HTTPS — use a tunnel (cloudflared/ngrok) or host the file on HTTPS, then reopen.', true);
+    startScreen.style.display = 'none';
+    return;
+  }
+  startScreen.style.display = 'none';
+  setHud('loading AR engine…');
+  const { MindARThree } = await import('mindar-image-three');
+  const mindar = new MindARThree({
+    container: document.getElementById('ar-container'),
+    imageTargetSrc: MIND_TARGET,
+  });
+  const { renderer, scene, camera } = mindar;
+  addLights(scene);
+  const anchor = mindar.addAnchor(0);
+  const world = new THREE.Group();
+  world.scale.setScalar(0.9);
+  anchor.group.add(world);
+  buildScene(world);
+  enablePicking(renderer, camera);
+  await mindar.start();
+  renderer.setAnimationLoop(() => { animateTotems(); renderer.render(scene, camera); });
+  setHud('scanning for marker…');
+}
+
+(async () => {
+  try {
+    setHud('loading monitors…');
+    await initMonitors();
+    pollOnce().catch(e => setHud('poll failed: ' + e.message, true));
+    setInterval(() => pollOnce().catch(e => setHud('poll failed: ' + e.message, true)), POLL_MS);
+    if (FLAT) {
+      await startFlat();
+    } else {
+      document.getElementById('start-btn').onclick = () => startAR().catch(e => setHud('AR failed: ' + e.message, true));
+    }
+  } catch (e) {
+    setHud('init failed: ' + e.message, true);
+  }
+})();
+</script>
+</body>
+</html>
