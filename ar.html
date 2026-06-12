@@ -5,7 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>Kuma AR — monitor totems</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #0b1020; overflow: hidden; font-family: system-ui, sans-serif; }
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; }
+  /* Background lives on html only: MindAR's camera <video> has z-index -2,
+     and an opaque body background would paint on top of it. */
+  html { background: #0b1020; }
   #ar-container { width: 100%; height: 100%; position: absolute; inset: 0; }
   #hud {
     position: fixed; top: 10px; left: 10px; z-index: 20;
@@ -164,7 +167,7 @@ async function pollOnce() {
   }
   monitors.forEach(updateTotem);
   if (selectedMonitor) renderDetail(selectedMonitor);
-  setHud(`${KUMA_MODE ? 'kuma: ' + KUMA_SLUG : 'demo: live-pinging google.com'}<br>updated ${new Date().toLocaleTimeString()}<br>tap a totem for details`);
+  setHud(`${KUMA_MODE ? 'kuma: ' + KUMA_SLUG : 'demo: live-pinging google.com'}${FLAT ? ' · FLAT PREVIEW (no camera)' : ''}<br>updated ${new Date().toLocaleTimeString()}<br>tap a totem for details`);
 }
 
 // ---------- 3D ----------
