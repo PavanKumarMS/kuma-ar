@@ -9,8 +9,14 @@ no WebXR required. Built with [three.js](https://threejs.org/) +
 ## Files
 
 - `ar.html` — the whole prototype (data polling + 3D scene + AR).
-- `marker.html` — shows the MindAR demo image target full-screen so you can
-  point a phone at your desktop monitor (or print it).
+- `marker.html` — shows the custom "FAKE DASHBOARD" marker full-screen so you
+  can point a phone at your desktop monitor (or print `marker.png`).
+- `marker.png` / `targets.mind` — the custom image target and its compiled
+  MindAR feature data.
+- `compile.html` + `upload_server.py` — dev tools that draw the marker,
+  compile it in-browser with MindAR's Compiler, and save both files. To
+  change the marker design, edit `drawDashboard()` in compile.html, run
+  `python upload_server.py`, and open `/compile.html` once.
 
 ## Modes
 

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Kuma AR — marker generator & compiler</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #f4f5f7; margin: 24px; }
+  #status { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
+  canvas { box-shadow: 0 2px 12px rgba(0,0,0,.2); max-width: 100%; }
+</style>
+</head>
+<body>
+<div id="status">drawing marker…</div>
+<canvas id="c" width="1200" height="900"></canvas>
+
+<script type="module">
+import { Compiler } from 'https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js';
+// Deterministic drawing — the printed marker must match the compiled one
+// exactly, so no randomness here.
+function drawDashboard(canvas) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = '#10182b'; ctx.lineWidth = 10; ctx.strokeRect(5, 5, W - 10, H - 10);
+
+  // header band
+  ctx.fillStyle = '#10182b'; ctx.fillRect(5, 5, W - 10, 110);
+  ctx.fillStyle = '#fbbf24'; ctx.fillRect(5, 115, W - 10, 14);
+  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 64px Arial'; ctx.textAlign = 'left';
+  ctx.fillText('FAKE DASHBOARD', 40, 82);
+  ctx.fillStyle = '#22c55e'; ctx.beginPath(); ctx.arc(1060, 60, 26, 0, 7); ctx.fill();
+  ctx.fillStyle = '#ef4444'; ctx.beginPath(); ctx.arc(1130, 60, 26, 0, 7); ctx.fill();
+
+  const panel = (x, y, w, h, title) => {
+    ctx.fillStyle = '#eef1f6'; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#10182b'; ctx.lineWidth = 4; ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = '#10182b'; ctx.font = 'bold 28px Arial'; ctx.textAlign = 'left';
+    ctx.fillText(title, x + 16, y + 38);
+  };
+
+  // line chart panel
+  panel(40, 160, 540, 330, 'RESPONSE TIME');
+  ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 2;
+  for (let i = 1; i < 5; i++) { ctx.beginPath(); ctx.moveTo(60, 160 + 60 + i * 50); ctx.lineTo(560, 160 + 60 + i * 50); ctx.stroke(); }
+  const pts = [420, 380, 430, 300, 340, 250, 310, 220, 270, 300, 240, 350, 280, 230, 320];
+  ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 7; ctx.beginPath();
+  pts.forEach((p, i) => { const x = 70 + i * 34, y = p + 60; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.stroke();
+  ctx.fillStyle = '#ef4444';
+  [3, 7, 11].forEach(i => { ctx.beginPath(); ctx.arc(70 + i * 34, pts[i] + 60, 11, 0, 7); ctx.fill(); });
+
+  // bar chart panel
+  panel(620, 160, 540, 330, 'UPTIME BY SERVICE');
+  const bars = [0.95, 0.6, 0.85, 0.3, 0.75, 0.9, 0.5, 0.99];
+  const cols = ['#22c55e', '#22c55e', '#f59e0b', '#ef4444', '#22c55e', '#22c55e', '#f59e0b', '#22c55e'];
+  bars.forEach((b, i) => {
+    ctx.fillStyle = cols[i];
+    const bh = b * 220;
+    ctx.fillRect(650 + i * 62, 460 - bh, 44, bh);
+    ctx.strokeStyle = '#10182b'; ctx.lineWidth = 3; ctx.strokeRect(650 + i * 62, 460 - bh, 44, bh);
+  });
+
+  // donut panel
+  panel(40, 530, 350, 330, 'STATUS MIX');
+  const donut = [[0, 3.8, '#22c55e'], [3.8, 5.1, '#f59e0b'], [5.1, 6.28, '#ef4444']];
+  donut.forEach(([a0, a1, col]) => {
+    ctx.beginPath(); ctx.fillStyle = col;
+    ctx.moveTo(215, 700); ctx.arc(215, 700, 120, a0, a1); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#10182b'; ctx.lineWidth = 4; ctx.stroke();
+  });
+  ctx.beginPath(); ctx.fillStyle = '#eef1f6'; ctx.arc(215, 700, 55, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#10182b'; ctx.stroke();
+
+  // status tile grid
+  panel(430, 530, 380, 330, 'MONITORS');
+  const tiles = ['#22c55e', '#22c55e', '#ef4444', '#22c55e', '#f59e0b', '#22c55e', '#22c55e', '#ef4444', '#22c55e', '#f59e0b', '#22c55e', '#22c55e'];
+  tiles.forEach((col, i) => {
+    const tx = 455 + (i % 4) * 88, ty = 585 + Math.floor(i / 4) * 88;
+    ctx.fillStyle = col; ctx.fillRect(tx, ty, 70, 70);
+    ctx.strokeStyle = '#10182b'; ctx.lineWidth = 4; ctx.strokeRect(tx, ty, 70, 70);
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 44px Arial'; ctx.textAlign = 'center';
+    ctx.fillText(col === '#ef4444' ? '✕' : col === '#f59e0b' ? '!' : '✓', tx + 35, ty + 51);
+  });
+
+  // big number + sparkline panel
+  panel(850, 530, 310, 330, 'SLA');
+  ctx.fillStyle = '#10182b'; ctx.font = 'bold 92px Arial'; ctx.textAlign = 'center';
+  ctx.fillText('99.4%', 1005, 680);
+  const spark = [40, 25, 45, 15, 35, 10, 42, 22, 38, 18, 44, 28];
+  ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 6; ctx.beginPath();
+  spark.forEach((s, i) => { const x = 880 + i * 24, y = 770 + s; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.stroke();
+
+  // asymmetric corner accents (helps tracking + orientation)
+  ctx.fillStyle = '#fbbf24'; ctx.beginPath();
+  ctx.moveTo(1160, 160); ctx.lineTo(1100, 160); ctx.lineTo(1160, 220); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#2563eb'; ctx.fillRect(40, 870, 90, 16);
+}
+
+async function main() {
+  const status = document.getElementById('status');
+  const canvas = document.getElementById('c');
+  drawDashboard(canvas);
+
+  status.textContent = 'uploading marker.png…';
+  const pngBlob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+  await fetch('http://127.0.0.1:8124/upload?name=marker.png', { method: 'POST', body: pngBlob });
+
+  const img = new Image();
+  img.src = canvas.toDataURL('image/png');
+  await img.decode();
+
+  const compiler = new Compiler();
+  window.__progress = 0;
+  await compiler.compileImageTargets([img], p => {
+    window.__progress = p;
+    status.textContent = 'compiling image target… ' + p.toFixed(0) + '%';
+  });
+  const buffer = await compiler.exportData();
+  status.textContent = 'uploading targets.mind…';
+  await fetch('http://127.0.0.1:8124/upload?name=targets.mind', { method: 'POST', body: new Blob([buffer]) });
+  status.textContent = 'DONE — marker.png + targets.mind saved';
+  window.__done = true;
+}
+main().catch(e => {
+  document.getElementById('status').textContent = 'ERROR: ' + e.message;
+  window.__error = e.message;
+});
+</script>
+</body>
+</html>
